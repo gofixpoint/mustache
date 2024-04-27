@@ -113,6 +113,36 @@ type Template struct {
 	escape   EscapeFunc
 }
 
+type TemplateOpt func(*Template)
+
+func WithSingleCurlyTags() TemplateOpt {
+	return func(t *Template) {
+		t.otag = "{"
+		t.ctag = "}"
+	}
+}
+
+func WithDoubleCurlyTags() TemplateOpt {
+	return func(t *Template) {
+		t.otag = "{{"
+		t.ctag = "}}"
+	}
+}
+
+func WithHTMLEscape(escapeHTML bool) TemplateOpt {
+	return func(t *Template) {
+		if escapeHTML {
+			t.escape = template.HTMLEscapeString
+		} else {
+			t.escape = echoString
+		}
+	}
+}
+
+func echoString(s string) string {
+	return s
+}
+
 // Tags returns the mustache tags for the given template
 func (tmpl *Template) Tags() []Tag {
 	return extractTags(tmpl.elems)
@@ -597,7 +627,7 @@ func (tmpl *Template) renderSection(section *sectionElement, contextChain []inte
 				return fmt.Errorf("lambda %q doesn't match required LambaFunc signature", section.name)
 			}
 			var text bytes.Buffer
-			if err := getSectionText(section.elems, &text); err != nil {
+			if err := tmpl.getSectionText(section.elems, &text); err != nil {
 				return err
 			}
 			render := func(text string) (string, error) {
@@ -642,40 +672,56 @@ func (tmpl *Template) renderSection(section *sectionElement, contextChain []inte
 	return nil
 }
 
-func getSectionText(elements []interface{}, buf io.Writer) error {
+func (t *Template) emitTag(inner string) string {
+	return fmt.Sprintf("%s%s%s", t.otag, inner, t.ctag)
+}
+
+func (t *Template) emitElement(element any) (string, error) {
+	switch elem := element.(type) {
+	case *textElement:
+		return string(elem.text), nil
+	case *varElement:
+		if elem.raw {
+			return t.emitTag(fmt.Sprintf("{%s}", elem.name)), nil
+		} else {
+			return t.emitTag(elem.name), nil
+		}
+	case *sectionElement:
+		parts := make([]string, 0, 2)
+		if elem.inverted {
+			parts = append(parts, t.emitTag(fmt.Sprintf("^%s", elem.name)))
+		} else {
+			parts = append(parts, t.emitTag(fmt.Sprintf("#%s", elem.name)))
+		}
+		for _, nelem := range elem.elems {
+			inner, err := t.emitElement(nelem)
+			if err != nil {
+				return "", err
+			}
+			parts = append(parts, inner)
+		}
+		parts = append(parts, t.emitTag(fmt.Sprintf("/%s", elem.name)))
+		return strings.Join(parts, ""), nil
+	default:
+		return "", fmt.Errorf("unexpected element type %T", elem)
+	}
+}
+
+func (t *Template) getSectionText(elements []interface{}, buf io.Writer) error {
 	for _, element := range elements {
-		if err := getElementText(element, buf); err != nil {
+		if err := t.getElementText(element, buf); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func getElementText(element interface{}, buf io.Writer) error {
-	switch elem := element.(type) {
-	case *textElement:
-		fmt.Fprintf(buf, "%s", elem.text)
-	case *varElement:
-		if elem.raw {
-			fmt.Fprintf(buf, "{{{%s}}}", elem.name)
-		} else {
-			fmt.Fprintf(buf, "{{%s}}", elem.name)
-		}
-	case *sectionElement:
-		if elem.inverted {
-			fmt.Fprintf(buf, "{{^%s}}", elem.name)
-		} else {
-			fmt.Fprintf(buf, "{{#%s}}", elem.name)
-		}
-		for _, nelem := range elem.elems {
-			if err := getElementText(nelem, buf); err != nil {
-				return err
-			}
-		}
-		fmt.Fprintf(buf, "{{/%s}}", elem.name)
-	default:
-		return fmt.Errorf("unexpected element type %T", elem)
+func (t *Template) getElementText(element interface{}, buf io.Writer) error {
+	s, err := t.emitElement(element)
+	if err != nil {
+		return err
 	}
+	fmt.Fprint(buf, s)
 	return nil
 }
 
@@ -776,76 +822,100 @@ func (tmpl *Template) FRenderInLayout(out io.Writer, layout *Template, context .
 // ParseString compiles a mustache template string. The resulting output can
 // be used to efficiently render the template multiple times with different data
 // sources.
-func ParseString(data string) (*Template, error) {
-	return ParseStringRaw(data, false)
+func ParseString(data string, opts... TemplateOpt) (*Template, error) {
+	return ParseStringRaw(data, false, opts...)
 }
 
 // ParseStringRaw compiles a mustache template string. The resulting output can
 // be used to efficiently render the template multiple times with different data
 // sources.
-func ParseStringRaw(data string, forceRaw bool) (*Template, error) {
+func ParseStringRaw(data string, forceRaw bool, opts... TemplateOpt) (*Template, error) {
 	cwd := os.Getenv("CWD")
 	partials := &FileProvider{
 		Paths: []string{cwd, " "},
 	}
 
-	return ParseStringPartialsRaw(data, partials, forceRaw)
+	return ParseStringPartialsRaw(data, partials, forceRaw, opts...)
 }
 
 // ParseStringPartials compiles a mustache template string, retrieving any
 // required partials from the given provider. The resulting output can be used
 // to efficiently render the template multiple times with different data
 // sources.
-func ParseStringPartials(data string, partials PartialProvider) (*Template, error) {
-	return ParseStringPartialsRaw(data, partials, false)
+func ParseStringPartials(data string, partials PartialProvider, opts... TemplateOpt) (*Template, error) {
+	return ParseStringPartialsRaw(data, partials, false, opts...)
 }
 
 // ParseStringPartialsRaw compiles a mustache template string, retrieving any
 // required partials from the given provider. The resulting output can be used
 // to efficiently render the template multiple times with different data
 // sources.
-func ParseStringPartialsRaw(data string, partials PartialProvider, forceRaw bool) (*Template, error) {
-	tmpl := Template{data, "{{", "}}", 0, 1, []interface{}{}, forceRaw, partials, template.HTMLEscapeString}
+func ParseStringPartialsRaw(data string, partials PartialProvider, forceRaw bool, opts... TemplateOpt) (*Template, error) {
+	tmpl := &Template{
+		data: data,
+		otag: "{{",
+		ctag: "}}",
+		p: 0,
+		curline: 1,
+		elems: []interface{}{},
+		forceRaw: forceRaw,
+		partial: partials,
+		escape: template.HTMLEscapeString,
+	}
+	for _, opt := range opts {
+		opt(tmpl)
+	}
+
 	err := tmpl.parse()
 
 	if err != nil {
 		return nil, err
 	}
 
-	return &tmpl, err
+	return tmpl, err
 }
 
 // ParseFile loads a mustache template string from a file and compiles it. The
 // resulting output can be used to efficiently render the template multiple
 // times with different data sources.
-func ParseFile(filename string) (*Template, error) {
+func ParseFile(filename string, opts... TemplateOpt) (*Template, error) {
 	dirname, _ := path.Split(filename)
 	partials := &FileProvider{
 		Paths: []string{dirname, " "},
 	}
 
-	return ParseFilePartials(filename, partials)
+	return ParseFilePartials(filename, partials, opts...)
 }
 
 // ParseFilePartials loads a mustache template string from a file, retrieving any
 // required partials from the given provider, and compiles it. The resulting
 // output can be used to efficiently render the template multiple times with
 // different data sources.
-func ParseFilePartials(filename string, partials PartialProvider) (*Template, error) {
-	return ParseFilePartialsRaw(filename, false, partials)
+func ParseFilePartials(filename string, partials PartialProvider, opts... TemplateOpt) (*Template, error) {
+	return ParseFilePartialsRaw(filename, false, partials, opts...)
 }
 
 // ParseFilePartialsRaw loads a mustache template string from a file, retrieving
 // any required partials from the given provider, and compiles it. The resulting
 // output can be used to efficiently render the template multiple times with
 // different data sources.
-func ParseFilePartialsRaw(filename string, forceRaw bool, partials PartialProvider) (*Template, error) {
+func ParseFilePartialsRaw(filename string, forceRaw bool, partials PartialProvider, opts... TemplateOpt) (*Template, error) {
 	data, err := os.ReadFile(filename)
 	if err != nil {
 		return nil, err
 	}
 
-	tmpl := Template{string(data), "{{", "}}", 0, 1, []interface{}{}, forceRaw, partials, template.HTMLEscapeString}
+	tmpl := Template{
+		data: string(data),
+		otag: "{{",
+		ctag: "}}",
+		p: 0,
+		curline: 1,
+		elems: []interface{}{},
+		forceRaw: forceRaw,
+		partial: partials,
+		escape: template.HTMLEscapeString,
+	}
 	err = tmpl.parse()
 
 	if err != nil {
@@ -858,84 +928,49 @@ func ParseFilePartialsRaw(filename string, forceRaw bool, partials PartialProvid
 // Render compiles a mustache template string and uses the the given data source
 // - generally a map or struct - to render the template and return the output.
 func Render(data string, context ...interface{}) (string, error) {
-	return RenderRaw(data, false, context...)
+	return renderRaw(nil, data, false, context...)
 }
 
 // RenderRaw compiles a mustache template string and uses the the given data
 // source - generally a map or struct - to render the template and return the
 // output.
 func RenderRaw(data string, forceRaw bool, context ...interface{}) (string, error) {
-	return RenderPartialsRaw(data, nil, forceRaw, context...)
+	return renderPartialsRaw(nil, data, nil, forceRaw, context...)
 }
 
 // RenderPartials compiles a mustache template string and uses the the given partial
 // provider and data source - generally a map or struct - to render the template
 // and return the output.
 func RenderPartials(data string, partials PartialProvider, context ...interface{}) (string, error) {
-	return RenderPartialsRaw(data, partials, false, context...)
+	return renderPartialsRaw(nil, data, partials, false, context...)
 }
 
 // RenderPartialsRaw compiles a mustache template string and uses the the given
 // partial provider and data source - generally a map or struct - to render the
 // template and return the output.
 func RenderPartialsRaw(data string, partials PartialProvider, forceRaw bool, context ...interface{}) (string, error) {
-	var tmpl *Template
-	var err error
-	if partials == nil {
-		tmpl, err = ParseStringRaw(data, forceRaw)
-	} else {
-		tmpl, err = ParseStringPartialsRaw(data, partials, forceRaw)
-	}
-	if err != nil {
-		return "", err
-	}
-	return tmpl.Render(context...)
+	return renderPartialsRaw(nil, data, partials, forceRaw, context...)
 }
 
 // RenderInLayout compiles a mustache template string and layout "wrapper" and
 // uses the given data source - generally a map or struct - to render the
 // compiled templates and return the output.
 func RenderInLayout(data string, layoutData string, context ...interface{}) (string, error) {
-	return RenderInLayoutPartials(data, layoutData, nil, context...)
+	return renderInLayoutPartials(nil, data, layoutData, nil, context...)
 }
 
 // RenderInLayoutPartials compiles a mustache template string and layout
 // "wrapper" and uses the given data source - generally a map or struct - to
 // render the compiled templates and return the output.
 func RenderInLayoutPartials(data string, layoutData string, partials PartialProvider, context ...interface{}) (string, error) {
-	var layoutTmpl, tmpl *Template
-	var err error
-	if partials == nil {
-		layoutTmpl, err = ParseString(layoutData)
-	} else {
-		layoutTmpl, err = ParseStringPartials(layoutData, partials)
-	}
-	if err != nil {
-		return "", err
-	}
-
-	if partials == nil {
-		tmpl, err = ParseString(data)
-	} else {
-		tmpl, err = ParseStringPartials(data, partials)
-	}
-
-	if err != nil {
-		return "", err
-	}
-
-	return tmpl.RenderInLayout(layoutTmpl, context...)
+	return renderInLayoutPartials(nil, data, layoutData, partials, context...)
 }
 
 // RenderFile loads a mustache template string from a file and compiles it, and
 // then uses the given data source - generally a map or struct - to render the
 // template and return the output.
 func RenderFile(filename string, context ...interface{}) (string, error) {
-	tmpl, err := ParseFile(filename)
-	if err != nil {
-		return "", err
-	}
-	return tmpl.Render(context...)
+	return renderFile(nil, filename, context...)
 }
 
 // RenderFileInLayout loads a mustache template string and layout "wrapper"
@@ -943,14 +978,5 @@ func RenderFile(filename string, context ...interface{}) (string, error) {
 // data source - generally a map or struct - to render the compiled templates
 // and return the output.
 func RenderFileInLayout(filename string, layoutFile string, context ...interface{}) (string, error) {
-	layoutTmpl, err := ParseFile(layoutFile)
-	if err != nil {
-		return "", err
-	}
-
-	tmpl, err := ParseFile(filename)
-	if err != nil {
-		return "", err
-	}
-	return tmpl.RenderInLayout(layoutTmpl, context...)
+	return renderFileInLayout(nil, filename, layoutFile, context...)
 }
